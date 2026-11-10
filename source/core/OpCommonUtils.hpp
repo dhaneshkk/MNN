@@ -49,7 +49,9 @@ public:
     
     static void rasterInputReset(const std::vector<Tensor*>& inputs, Tensor* output);
 
-    static bool loadExternalDatas(FileLoader* loader, std::vector<char*> addrs, const int64_t* external);
+    // external = [offset, len0, len1, ...]; each len must fit its destination (dstBytes).
+    static bool loadExternalDatas(FileLoader* loader, const std::vector<char*>& addrs,
+                                  const std::vector<int64_t>& dstBytes, const int64_t* external, size_t externalCount);
     struct TensorConvertParameter {
         int batch;
         int channel;

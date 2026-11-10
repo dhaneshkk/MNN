@@ -84,11 +84,17 @@ bool initConstTensors(std::vector<std::shared_ptr<Tensor>>& tensors, const Net* 
                     tmp.reset((new half_float::half[size]));
                     src = tmp.get();
                     if (!OpCommonUtils::loadExternalDatas(external, {reinterpret_cast<char*>(src)},
-                                                          parameter->external()->data())) {
+                                                          {(int64_t)size * (int64_t)sizeof(half_float::half)},
+                                                          parameter->external()->data(),
+                                                          parameter->external()->size())) {
                         code = INPUT_DATA_ERROR;
                         return false;
                     }
                 } else {
+                    if (parameter->uint8s()->size() < (size_t)size * sizeof(half_float::half)) {
+                        code = INVALID_VALUE;
+                        return false;
+                    }
                     src = (half_float::half*)parameter->uint8s()->data();
                 }
                 for (int i=0; i<size; ++i) {
