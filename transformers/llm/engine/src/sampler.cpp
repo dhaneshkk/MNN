@@ -24,10 +24,17 @@ namespace Transformer {
 // SamplerState methods
 void SamplerState::ensureProbs(float temperature) {
     if (!probs.empty()) return;
-    float invTemp = 1.0f / temperature;
     // find max for numerical stability
     float maxLogit = *std::max_element(logits.begin(), logits.end());
     probs.resize(logits.size());
+    float invTemp = 1.0f / temperature;
+    if (!(temperature > 0.0f) || !std::isfinite(invTemp)) {
+        // Greedy limit: all mass on the first argmax, so topP/minP/typical keep it.
+        auto best = std::max_element(logits.begin(), logits.end()) - logits.begin();
+        std::fill(probs.begin(), probs.end(), 0.0f);
+        probs[best] = 1.0f;
+        return;
+    }
     float sum = 0.0f;
     for (size_t i = 0; i < logits.size(); ++i) {
         probs[i] = std::exp((logits[i] - maxLogit) * invTemp);
@@ -713,7 +720,10 @@ void Sampler::stepBannedTokens(SamplerState& state) {
 }
 
 void Sampler::stepSelect(SamplerState& state) {
-    if (mConfig.select_type == "greedy") {
+    // temperature <= 0 (or a NaN) is the greedy limit; 1/0 would turn every prob into NaN.
+    const bool greedy = mConfig.select_type == "greedy" || !(mConfig.temperature > 0.0f) ||
+                        !std::isfinite(1.0f / mConfig.temperature);
+    if (greedy) {
         // argmax
         int bestIdx = 0;
         float bestScore = state.logits[0];
