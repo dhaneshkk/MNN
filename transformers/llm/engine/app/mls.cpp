@@ -136,7 +136,9 @@ static int print_usage() {
     std::cout << "  mls download model_name : download the model" << std::endl;
     std::cout << "  mls run  model_name : download the model" << std::endl;
     std::cout << "  mls benchmark:  model_name test benchmark of a model" << std::endl;
-    std::cout << "  mls serve: serve with openai compatible api" << std::endl;
+    std::cout << "  mls serve model_name|-c config.json [--host H] [--port P] [--api-key K] [--cors-origin O] [--log-content]"
+              << std::endl;
+    std::cout << "      OpenAI-compatible API, default 127.0.0.1:9090. API key also read from MLS_API_KEY." << std::endl;
     std::cout << "  mls delete model_name: remove the download model" << std::endl;
     return 0;
 }
@@ -174,20 +176,56 @@ static int serve(int argc, const char *argv[]) {
     if (arg.find('-') != 0) {
         config_path = (fs::path(mls::FileUtils::GetBaseCacheDir()) / arg / "config.json").string();
     }
+    mls::ServerOptions options;
+    if (const char* key = std::getenv("MLS_API_KEY")) {
+        options.api_key = key;
+    }
     for (int i = 2; i < argc; i++) {
         arg = argv[i];
-        if (arg == "-c") {
-            if (++i >= argc) {
+        const bool hasValue = i + 1 < argc;
+        if (arg == "-c" || arg == "--host" || arg == "--port" || arg == "--api-key" || arg == "--cors-origin") {
+            if (!hasValue) {
                 invalid_param = true;
                 break;
             }
-            config_path = mls::FileUtils::ExpandTilde(argv[i]);
+            std::string value = argv[++i];
+            if (arg == "-c") {
+                config_path = mls::FileUtils::ExpandTilde(value);
+            } else if (arg == "--host") {
+                options.host = value;
+            } else if (arg == "--port") {
+                char* end = nullptr;
+                long port = std::strtol(value.c_str(), &end, 10);
+                if (end == value.c_str() || *end != '\0' || port <= 0 || port > 65535) {
+                    invalid_param = true;
+                    break;
+                }
+                options.port = static_cast<int>(port);
+            } else if (arg == "--api-key") {
+                options.api_key = value;
+            } else {
+                options.cors_origin = value;
+            }
+        } else if (arg == "--log-content") {
+            options.log_content = true;
         }
+    }
+    if (invalid_param || config_path.empty()) {
+        print_usage();
+        return 1;
+    }
+    options.model_id = fs::path(config_path).parent_path().filename().string();
+    if (options.model_id.empty()) {
+        options.model_id = "mnn";
     }
     mls::MlsServer server;
     bool is_r1 = IsR1(config_path);
     auto llm = create_and_prepare_llm(config_path.c_str(), !is_r1);
-    server.Start(llm.get(), is_r1);
+    if (!llm) {
+        std::cerr << "Failed to load model from " << config_path << std::endl;
+        return 1;
+    }
+    server.Start(llm.get(), is_r1, options);
     return 0;
 }
 

@@ -172,6 +172,8 @@ public:
     std::vector<Express::VARP> getOutputs() const;
     int getOutputIndex(const std::string& name) const;
     void reset();
+    // Stop the current generation at the next decode step; call from the generating thread (e.g. the output stream).
+    void cancel();
     void tuning(TuneType type, std::vector<int> candidates);
     virtual std::vector<Express::VARP> forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs = {});
     Express::VARP forward(const std::vector<int>& input_ids, bool is_prefill = true);

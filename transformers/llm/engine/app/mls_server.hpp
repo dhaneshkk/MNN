@@ -4,63 +4,133 @@
 //
 
 #pragma once
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <string>
+#include <vector>
 #include "llm/llm.hpp"
 #include "httplib.h"
 #include "jsonhpp/json.hpp"
 using nlohmann::json;
 using PromptItem = std::pair<std::string, std::string>;
 namespace mls {
+
 class LlmStreamBuffer : public std::streambuf {
 public:
   using CallBack = std::function<void(const char* str, size_t len)>;
   explicit LlmStreamBuffer(CallBack callback) : callback_(std::move(callback)) {}
   ~LlmStreamBuffer() override = default;
 protected:
-  virtual std::streamsize xsputn(const char* s, std::streamsize n) override {
+  std::streamsize xsputn(const char* s, std::streamsize n) override {
     if (callback_) {
       callback_(s, n);
     }
     return n;
+  }
+  // Single-char writes bypass xsputn; without this the ostream goes bad after the first `<< 'c'`.
+  int_type overflow(int_type ch) override {
+    if (traits_type::eq_int_type(ch, traits_type::eof())) {
+      return traits_type::not_eof(ch);
+    }
+    char c = traits_type::to_char_type(ch);
+    if (callback_) {
+      callback_(&c, 1);
+    }
+    return ch;
   }
 
 private:
   CallBack callback_{};
 };
 
+// Re-chunks a byte stream on UTF-8 code point boundaries. Invalid bytes become U+FFFD instead of stalling.
 class Utf8StreamProcessor {
   public:
-    Utf8StreamProcessor(std::function<void(const std::string&)> callback)
-            : callback(callback) {}
+    explicit Utf8StreamProcessor(std::function<void(const std::string&)> callback)
+            : callback(std::move(callback)) {}
 
     void processStream(const char* str, size_t len) {
       utf8Buffer.append(str, len);
-
-      size_t i = 0;
       std::string completeChars;
+      size_t i = 0;
       while (i < utf8Buffer.size()) {
         int length = utf8CharLength(static_cast<unsigned char>(utf8Buffer[i]));
-        if (length == 0 || i + length > utf8Buffer.size()) {
+        if (length == 0 || !continuationValid(i, length)) {
+          completeChars.append("\xEF\xBF\xBD");
+          i += 1;
+          continue;
+        }
+        if (i + length > utf8Buffer.size()) {
           break;
         }
         completeChars.append(utf8Buffer, i, length);
         i += length;
       }
-      utf8Buffer = utf8Buffer.substr(i);
+      utf8Buffer.erase(0, i);
       if (!completeChars.empty()) {
         callback(completeChars);
       }
     }
-    int utf8CharLength(unsigned char byte) {
-      if ((byte & 0x80) == 0) return 1;     
+    // Emit whatever is left (a truncated sequence) at end of generation.
+    void flush() {
+      if (!utf8Buffer.empty()) {
+        utf8Buffer.clear();
+        callback("\xEF\xBF\xBD");
+      }
+    }
+    static int utf8CharLength(unsigned char byte) {
+      if ((byte & 0x80) == 0) return 1;
       if ((byte & 0xE0) == 0xC0) return 2;
       if ((byte & 0xF0) == 0xE0) return 3;
       if ((byte & 0xF8) == 0xF0) return 4;
       return 0;
     }
   private:
+    bool continuationValid(size_t start, int length) const {
+      for (int k = 1; k < length && start + k < utf8Buffer.size(); ++k) {
+        if ((static_cast<unsigned char>(utf8Buffer[start + k]) & 0xC0) != 0x80) {
+          return false;
+        }
+      }
+      return true;
+    }
     std::string utf8Buffer;
     std::function<void(const std::string&)> callback;
   };
+
+struct ServerOptions {
+    std::string host = "127.0.0.1";
+    int port = 9090;
+    std::string api_key;      // empty: no auth (only sensible on loopback)
+    std::string cors_origin;  // empty: no CORS headers
+    bool log_content = false; // log prompts and completions to stdout
+    std::string model_id = "mnn";
+};
+
+// Validated /chat/completions request.
+struct ChatRequest {
+    std::vector<PromptItem> prompts;
+    std::string model;
+    bool stream = false;
+    bool include_usage = false;
+    int max_tokens = -1;
+    bool has_temperature = false;
+    float temperature = 1.0f;
+    bool has_top_p = false;
+    float top_p = 1.0f;
+    std::vector<std::string> stop;
+};
+
+struct ChatResult {
+    std::string text;
+    std::string finish_reason = "stop";
+    bool error = false;
+    std::string error_message;
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+};
+
 class MlsServer {
   public:
     const char* html_content = R"""(
@@ -120,8 +190,28 @@ class MlsServer {
   <button id="reset-btn" class="button" onclick="resetChat()">Reset</button>
 
   <script>
-    const OPENAI_API_KEY = "no";  // put your real key or leave "no" if your server doesn't check it
-    const OPENAI_MODEL = "unknown";
+    const OPENAI_MODEL = "mnn";
+    function apiKey() {
+      try { return sessionStorage.getItem("mls_api_key") || ""; } catch (e) { return ""; }
+    }
+    function authHeaders(extra) {
+      const h = Object.assign({ "Content-Type": "application/json" }, extra || {});
+      const k = apiKey();
+      if (k) h.Authorization = `Bearer ${k}`;
+      return h;
+    }
+    async function authedFetch(url, init) {
+      let res = await fetch(url, init);
+      if (res.status === 401) {
+        const k = window.prompt("API key for this server:");
+        if (k) {
+          try { sessionStorage.setItem("mls_api_key", k); } catch (e) {}
+          init.headers = authHeaders(init.headers && init.headers.Accept ? { Accept: init.headers.Accept } : {});
+          res = await fetch(url, init);
+        }
+      }
+      return res;
+    }
     let messages = [
       { role: "system", content: "You are a helpful assistant." },
     ];
@@ -129,14 +219,11 @@ class MlsServer {
     async function resetChat() {
       document.getElementById("user-input").value = "";
       document.getElementById("chat-container").innerHTML = "";
-      messages = [];
+      messages = [{ role: "system", content: "You are a helpful assistant." }];
 
-      await fetch("/reset", {
+      await authedFetch("/reset", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
+        headers: authHeaders(),
         body: JSON.stringify({ reset: true }),
       });
     }
@@ -161,13 +248,9 @@ class MlsServer {
           stream: true,
         };
 
-        const response = await fetch("/chat/completions", {
+        const response = await authedFetch("/v1/chat/completions", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-            Accept: "text/event-stream",
-          },
+          headers: authHeaders({ Accept: "text/event-stream" }),
           body: JSON.stringify(payload),
         });
 
@@ -191,7 +274,11 @@ class MlsServer {
       const chatContainer = document.getElementById("chat-container");
       const messageElem = document.createElement("div");
       messageElem.classList.add("message", "assistant");
-      messageElem.innerHTML = `<strong class="assistant">Assistant:</strong> <span></span>`;
+      const label = document.createElement("strong");
+      label.className = "assistant";
+      label.textContent = "Assistant: ";
+      messageElem.appendChild(label);
+      messageElem.appendChild(document.createElement("span"));
       chatContainer.appendChild(messageElem);
       chatContainer.scrollTop = chatContainer.scrollHeight;
       const messageTextSpan = messageElem.querySelector("span");
@@ -199,6 +286,7 @@ class MlsServer {
       // Read the response body as a stream
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
+      let pending = "";
 
       try {
         while (true) {
@@ -207,8 +295,9 @@ class MlsServer {
             break;
           }
 
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split("\n");
+          pending += decoder.decode(value, { stream: true });
+          const lines = pending.split("\n");
+          pending = lines.pop();
           for (let line of lines) {
             if (!line || !line.startsWith("data: ")) {
               continue;
@@ -222,7 +311,8 @@ class MlsServer {
             try {
               const parsed = JSON.parse(jsonStr);
               if (parsed.choices && parsed.choices.length > 0) {
-                const deltaContent = parsed.choices[0].delta.content;
+                const delta = parsed.choices[0].delta || {};
+                const deltaContent = delta.content;
                 if (deltaContent) {
                   assistantMessage += deltaContent;
                   // Update the DOM text
@@ -245,11 +335,11 @@ class MlsServer {
       const messageElem = document.createElement("div");
       messageElem.classList.add("message", sender);
 
-      if (sender === "user") {
-        messageElem.innerHTML = `<strong class="user">User:</strong> ${text}`;
-      } else {
-        messageElem.innerHTML = `<strong class="assistant">Assistant:</strong> ${text}`;
-      }
+      const label = document.createElement("strong");
+      label.className = sender;
+      label.textContent = sender === "user" ? "User: " : "Assistant: ";
+      messageElem.appendChild(label);
+      messageElem.appendChild(document.createTextNode(text));
 
       chatContainer.appendChild(messageElem);
       chatContainer.scrollTop = chatContainer.scrollHeight;
@@ -258,14 +348,21 @@ class MlsServer {
 </body>
 </html>
     )""";
-    void Start(MNN::Transformer::Llm* llm, bool is_r1);
+    void Start(MNN::Transformer::Llm* llm, bool is_r1, const ServerOptions& options = ServerOptions());
     bool is_r1_{false};
 private:
-  void Answer(MNN::Transformer::Llm* llm, const json &messages, std::function<void(const std::string&)> on_result);
-  void AnswerStreaming(MNN::Transformer::Llm* llm,
-                     const json& messages,
-                     std::function<void(const std::string&, bool end)> on_partial);
+    // Runs one generation under llm_mutex_. on_delta (may be empty) receives text as it is produced;
+    // returning false cancels generation (client went away).
+    ChatResult Generate(MNN::Transformer::Llm* llm, const ChatRequest& request,
+                        const std::function<bool(const std::string&)>& on_delta);
+    bool Authorized(const httplib::Request& req) const;
+    void AllowCors(httplib::Response& res) const;
     std::mutex llm_mutex_;
-
+    ServerOptions options_;
+    float default_temperature_ = 1.0f;
+    float default_top_p_ = 0.9f;
 };
+
+// Parses an OpenAI chat request; on failure returns false and sets error/param.
+bool ParseChatRequest(const json& body, ChatRequest& out, std::string& error, std::string& param);
 }
