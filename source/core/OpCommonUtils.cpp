@@ -8,6 +8,7 @@
 
 #include "OpCommonUtils.hpp"
 #include "core/Execution.hpp"
+#include <cstring>
 #include "MNN_generated.h"
 #include "Macro.h"
 
@@ -48,7 +49,7 @@ Tensor::DimensionType OpCommonUtils::convertDimType(MNN_DATA_FORMAT dimensionFor
 }
 
 bool OpCommonUtils::loadBlobData(FileLoader* loader, const Op* op, char* ptr, int size) {
-    if (OpParameter_Blob != op->main_type()) {
+    if (OpParameter_Blob != op->main_type() || size < 0) {
         return false;
     }
     auto b       = op->main_as_Blob();
@@ -56,33 +57,48 @@ bool OpCommonUtils::loadBlobData(FileLoader* loader, const Op* op, char* ptr, in
         if (op->externalPath() != nullptr) {
             loader = new FileLoader(op->externalPath()->c_str());
         }
-        const bool loaded = loadExternalDatas(loader, {ptr}, b->external()->data());
+        const bool loaded = loadExternalDatas(loader, {ptr}, {(int64_t)size}, b->external()->data(),
+                                              b->external()->size());
         if (op->externalPath() != nullptr) {
             delete loader;
         }
         return loaded;
     }
-    void* result = nullptr;
+    const void* result = nullptr;
+    size_t available   = 0;
     switch (b->dataType()) {
         case DataType_DT_FLOAT:
-            result = (void*)b->float32s()->Data();
-            break;
-        case DataType_DT_BFLOAT16:
-            result = (void*)b->uint8s()->Data();
+            if (b->float32s()) {
+                result    = b->float32s()->Data();
+                available = b->float32s()->size() * sizeof(float);
+            }
             break;
         case DataType_DT_INT32:
-            result = (void*)b->int32s()->Data();
+            if (b->int32s()) {
+                result    = b->int32s()->Data();
+                available = b->int32s()->size() * sizeof(int32_t);
+            }
             break;
+        case DataType_DT_BFLOAT16:
         case DataType_DT_QUINT8:
         case DataType_DT_UINT8:
-            result = (void*)b->uint8s()->Data();
+            if (b->uint8s()) {
+                result    = b->uint8s()->Data();
+                available = b->uint8s()->size();
+            }
             break;
         case DataType_DT_INT8:
-            result = (void*)b->int8s()->Data();
+            if (b->int8s()) {
+                result    = b->int8s()->Data();
+                available = b->int8s()->size();
+            }
             break;
         default:
-            MNN_ASSERT(false);
             break;
+    }
+    if (nullptr == result || available < (size_t)size) {
+        MNN_ERROR("Invalid blob data for op %s\n", op->name() ? op->name()->c_str() : "");
+        return false;
     }
     ::memcpy(ptr, result, size);
     return true;
@@ -864,9 +880,22 @@ Execution* OpCommonUtils::createExecutionWithExternal(Backend* backend, const st
 #endif
 }
 
-bool OpCommonUtils::loadExternalDatas(FileLoader* fileloader, std::vector<char*> addrs, const int64_t* external) {
-    if (!fileloader || fileloader->offset(external[0]) != 0)
+bool OpCommonUtils::loadExternalDatas(FileLoader* fileloader, const std::vector<char*>& addrs,
+                                      const std::vector<int64_t>& dstBytes, const int64_t* external,
+                                      size_t externalCount) {
+    if (!fileloader || nullptr == external || addrs.size() != dstBytes.size() || externalCount < addrs.size() + 1) {
         return false;
+    }
+    for (int i = 0; i < addrs.size(); i++) {
+        if (external[i + 1] < 0 || external[i + 1] > dstBytes[i]) {
+            MNN_ERROR("External data length %lld exceeds tensor bytes %lld\n", (long long)external[i + 1],
+                      (long long)dstBytes[i]);
+            return false;
+        }
+    }
+    if (fileloader->offset(external[0]) != 0) {
+        return false;
+    }
     for (int i = 0; i < addrs.size(); i++) {
         if (!fileloader->read(addrs[i], external[i + 1]))
             return false;

@@ -167,6 +167,10 @@ bool Llm::set_config(const std::string& content) {
             mBlockSize = mValidBlockSize[mValidBlockSize.size()-1];
         } while (false);
     }
+    // Sampler copies its parameters at creation, so rebuild it for changes to take effect after load().
+    if (mSampler) {
+        mSampler.reset(Sampler::createSampler(mContext, mConfig));
+    }
     return true;
 }
 
@@ -879,6 +883,16 @@ void Llm::reset() {
     mContext->audio_input_s = 0.0f;
     mMeta->remove = mMeta->previous;
     mCachedPromptText.clear();
+    // Cancel and timeout are per-request; without this every later response() is rejected by CHECK_LLM_RUNNING.
+    if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::TIMEOUT) {
+        mContext->status = LlmStatus::RUNNING;
+    }
+}
+
+void Llm::cancel() {
+    if (mContext->status == LlmStatus::RUNNING) {
+        mContext->status = LlmStatus::USER_CANCEL;
+    }
 }
 
 void Llm::generate_init(std::ostream* os, const char* end_with) {
